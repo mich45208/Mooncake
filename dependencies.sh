@@ -94,42 +94,52 @@ fi
 
 # Update package lists
 print_section "Updating package lists"
-apt-get update
+dnf makecache
 check_success "Failed to update package lists"
+
+# Enable additional repositories for some packages
+print_section "Enabling additional repositories"
+dnf install -y epel-release || true
+dnf install -y dnf-plugins-core || true
+# Try to enable CRB (may not exist on all systems)
+dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null || true
+print_success "Additional repositories configured"
 
 # Install system packages
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
-SYSTEM_PACKAGES="build-essential \
+SYSTEM_PACKAGES="gcc \
+                  gcc-c++ \
+                  make \
                   cmake \
                   git \
                   wget \
                   unzip \
-                  libibverbs-dev \
-                  libgoogle-glog-dev \
-                  libgtest-dev \
-                  libjsoncpp-dev \
-                  libunwind-dev \
-                  libnuma-dev \
-                  libpython3-dev \
-                  libboost-all-dev \
-                  libssl-dev \
-                  libgrpc-dev \
-                  libgrpc++-dev \
-                  libprotobuf-dev \
-                  libyaml-cpp-dev \
-                  protobuf-compiler-grpc \
-                  libcurl4-openssl-dev \
-                  libhiredis-dev \
-                  liburing-dev \
-                  libjemalloc-dev \
-                  pkg-config \
+                  rdma-core-devel \
+                  glog-devel \
+                  gtest-devel \
+                  jsoncpp-devel \
+                  libunwind-devel \
+                  numactl-devel \
+                  python3-devel \
+                  boost-devel \
+                  openssl-devel \
+                  grpc-devel \
+                  grpc-plugins \
+                  protobuf-devel \
+                  yaml-cpp-devel \
+                  protobuf-compiler \
+                  libcurl-devel \
+                  hiredis-devel \
+                  liburing-devel \
+                  jemalloc-devel \
+                  pkgconfig \
                   patchelf \
-                  libc6-dev \
-                  libc-bin"
+                  glibc-devel \
+                  glibc-common"
 
-apt-get install -y $SYSTEM_PACKAGES
+dnf install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"
 print_success "System packages installed successfully"
 

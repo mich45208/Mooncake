@@ -18,6 +18,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
 
@@ -28,7 +29,7 @@ const uint64_t kMetricReportIntervalSeconds = 10;
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : master_service_(MasterServiceConfig(config)),
-      http_server_(4, config.http_port),
+      http_server_(4, config.http_port, stripBrackets(config.http_host)),
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
