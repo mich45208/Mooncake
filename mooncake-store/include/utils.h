@@ -360,6 +360,18 @@ void free_memory(const std::string& protocol, void* ptr);
 // Network utility functions
 
 /**
+ * @brief Strip brackets from IPv6 addresses
+ * @param addr Address string, e.g., "[2401:db00::1]"
+ * @return Address without brackets, e.g., "2401:db00::1"
+ */
+[[nodiscard]] inline std::string stripBrackets(const std::string& addr) {
+    if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']') {
+        return addr.substr(1, addr.size() - 2);
+    }
+    return addr;
+}
+
+/**
  * @brief Check if a TCP port is available for binding
  * @param port The port number to check
  * @return true if port is available, false otherwise
