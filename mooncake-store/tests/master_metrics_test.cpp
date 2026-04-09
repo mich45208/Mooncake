@@ -511,6 +511,37 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
 }
 
+// Verify that WrappedMasterServiceConfig constructed from
+// MasterServiceSupervisorConfig correctly propagates rpc_address → http_host
+// (coverage for master_config.h line added in ipv6 commit).
+TEST_F(MasterMetricsTest, WrappedConfigFromSupervisorConfigHttpHost) {
+    MasterServiceSupervisorConfig supervisor_config;
+    // Fill all RequiredParam fields
+    supervisor_config.enable_metric_reporting = true;
+    supervisor_config.metrics_port = 9003;
+    supervisor_config.default_kv_lease_ttl = 10000;
+    supervisor_config.default_kv_soft_pin_ttl = 5000;
+    supervisor_config.allow_evict_soft_pinned_objects = false;
+    supervisor_config.eviction_ratio = 0.9;
+    supervisor_config.eviction_high_watermark_ratio = 0.95;
+    supervisor_config.client_live_ttl_sec = 30;
+    supervisor_config.enable_offload = false;
+    supervisor_config.rpc_port = 50051;
+    supervisor_config.rpc_thread_num = 4;
+
+    // IPv6 bracketed address is forwarded verbatim to http_host
+    supervisor_config.rpc_address = "[::1]";
+    WrappedMasterServiceConfig wrapped_ipv6(supervisor_config, /*view_version=*/1);
+    EXPECT_EQ(wrapped_ipv6.http_host, "[::1]");
+    EXPECT_EQ(wrapped_ipv6.http_port, static_cast<uint16_t>(9003));
+    EXPECT_TRUE(wrapped_ipv6.enable_ha);
+
+    // Plain IPv4 address is also forwarded correctly
+    supervisor_config.rpc_address = "192.168.1.1";
+    WrappedMasterServiceConfig wrapped_ipv4(supervisor_config, /*view_version=*/2);
+    EXPECT_EQ(wrapped_ipv4.http_host, "192.168.1.1");
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
