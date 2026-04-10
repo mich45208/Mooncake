@@ -531,14 +531,16 @@ TEST_F(MasterMetricsTest, WrappedConfigFromSupervisorConfigHttpHost) {
 
     // IPv6 bracketed address is forwarded verbatim to http_host
     supervisor_config.rpc_address = "[::1]";
-    WrappedMasterServiceConfig wrapped_ipv6(supervisor_config, /*view_version=*/1);
+    WrappedMasterServiceConfig wrapped_ipv6(supervisor_config,
+                                            /*view_version=*/1);
     EXPECT_EQ(wrapped_ipv6.http_host, "[::1]");
     EXPECT_EQ(wrapped_ipv6.http_port, static_cast<uint16_t>(9003));
     EXPECT_TRUE(wrapped_ipv6.enable_ha);
 
     // Plain IPv4 address is also forwarded correctly
     supervisor_config.rpc_address = "192.168.1.1";
-    WrappedMasterServiceConfig wrapped_ipv4(supervisor_config, /*view_version=*/2);
+    WrappedMasterServiceConfig wrapped_ipv4(supervisor_config,
+                                            /*view_version=*/2);
     EXPECT_EQ(wrapped_ipv4.http_host, "192.168.1.1");
 }
 
