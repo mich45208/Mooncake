@@ -364,11 +364,11 @@ void free_memory(const std::string& protocol, void* ptr);
  * @param addr Address string, e.g., "[2401:db00::1]"
  * @return Address without brackets, e.g., "2401:db00::1"
  */
-[[nodiscard]] inline std::string stripBrackets(const std::string& addr) {
+[[nodiscard]] inline std::string stripBrackets(std::string_view addr) {
     if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']') {
-        return addr.substr(1, addr.size() - 2);
+        return std::string(addr.substr(1, addr.size() - 2));
     }
-    return addr;
+    return std::string(addr);
 }
 
 /**
