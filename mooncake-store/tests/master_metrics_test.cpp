@@ -531,6 +531,26 @@ TEST_F(MasterMetricsTest, AdminServerWithExplicitHttpHost) {
     admin_server.Stop();
 }
 
+// Verify the 3-argument constructor with a bracketed address, simulating the
+// master.cpp code path: MasterAdminServer(port, enable_metric_reporting,
+// master_config.rpc_address) where rpc_address may be "[<ipv6>]".
+TEST_F(MasterMetricsTest, AdminServerWithBracketedAddress) {
+    const int http_port = getFreeTcpPort();
+    // Bracketed IPv4 exercises the same stripBrackets + 3-arg constructor path
+    // that master.cpp line 959 uses with master_config.rpc_address.
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false,
+                                   "[127.0.0.1]");
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto health_resp = FetchUrl(http_port, "/health");
+    EXPECT_EQ(health_resp.http_status, 200);
+    EXPECT_NE(health_resp.body.find("\"status\":\"ok\""), std::string::npos);
+
+    admin_server.Stop();
+}
+
 // Cover BuildMetricsText() and BuildMetricsSummaryText() via their HTTP
 // endpoints (/metrics and /metrics/summary).
 TEST_F(MasterMetricsTest, AdminServerMetricsEndpoints) {
