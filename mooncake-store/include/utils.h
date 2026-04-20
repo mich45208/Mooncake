@@ -5,6 +5,7 @@
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <ylt/util/tl/expected.hpp>
 

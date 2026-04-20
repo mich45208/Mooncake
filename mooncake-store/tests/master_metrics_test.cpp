@@ -616,14 +616,18 @@ TEST_F(MasterMetricsTest, WrappedConfigFromSupervisorConfigHttpHost) {
 
 // Cover the MasterAdminServer constructor call inside
 // MasterServiceSupervisor::Start() (master_service_supervisor.cpp lines
-// 463-469). We use a privileged port (< 1024) so admin_server.Start() fails to
-// bind, but the constructor line (which passes rpc_address) is still executed.
+// 463-469). We pre-bind the metrics port so admin_server.Start() fails with
+// EADDRINUSE, which is deterministic regardless of privileges.
 TEST_F(MasterMetricsTest, SupervisorStartCoversAdminServerCreation) {
+    // Pre-bind a port so the supervisor's admin server cannot bind to it.
+    AutoPortBinder port_holder;
+    const int occupied_port = port_holder.getPort();
+
     MasterServiceSupervisorConfig config;
     config.ha_backend_type = "etcd";
     config.ha_backend_connstring = "http://127.0.0.1:1";
     config.cluster_id = "test-cluster";
-    config.metrics_port = 1;  // privileged port → bind will fail
+    config.metrics_port = occupied_port;  // already bound → EADDRINUSE
     config.enable_metric_reporting = false;
     config.rpc_address = "[::1]";
     config.rpc_port = 50051;
@@ -637,7 +641,7 @@ TEST_F(MasterMetricsTest, SupervisorStartCoversAdminServerCreation) {
     config.enable_offload = false;
 
     ha::MasterServiceSupervisor supervisor(config);
-    // Start() should return -1 because port 1 requires root privileges.
+    // Start() should return -1 because the metrics port is already in use.
     // The MasterAdminServer constructor with rpc_address is executed before
     // the failure, covering the changed lines.
     EXPECT_EQ(supervisor.Start(), -1);
