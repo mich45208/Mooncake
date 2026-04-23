@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "client_service.h"
 #include "replica.h"
 #include "types.h"
 
@@ -353,6 +354,51 @@ int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer) {
     if (!store) return -1;
     try {
         return as_client(store)->unregister_buffer(buffer);
+    } catch (...) {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache statistics
+// ---------------------------------------------------------------------------
+
+int mooncake_store_calc_cache_stats(mooncake_store_t store, char *buf_out,
+                                    size_t buf_len) {
+    if (!store || !buf_out || buf_len == 0) return -1;
+    try {
+        auto *handle = static_cast<StoreHandle *>(store);
+        if (!handle->client || !handle->client->client_) return -1;
+
+        auto stats_result = handle->client->client_->CalcCacheStats();
+        if (!stats_result.has_value()) return -1;
+
+        using CS = mooncake::MasterMetricManager::CacheHitStat;
+        auto &stats = stats_result.value();
+
+        auto get = [&](CS key) -> double {
+            auto it = stats.find(key);
+            return it != stats.end() ? it->second : 0.0;
+        };
+
+        char tmp[1024];
+        int len = snprintf(
+            tmp, sizeof(tmp),
+            "{\"memory_hits\":%.0f,\"ssd_hits\":%.0f,"
+            "\"memory_total\":%.0f,\"ssd_total\":%.0f,"
+            "\"memory_hit_rate\":%.4f,\"ssd_hit_rate\":%.4f,"
+            "\"overall_hit_rate\":%.4f,\"valid_get_rate\":%.4f}",
+            get(CS::MEMORY_HITS), get(CS::SSD_HITS), get(CS::MEMORY_TOTAL),
+            get(CS::SSD_TOTAL), get(CS::MEMORY_HIT_RATE),
+            get(CS::SSD_HIT_RATE), get(CS::OVERALL_HIT_RATE),
+            get(CS::VALID_GET_RATE));
+
+        if (len < 0) return -1;
+        size_t copy_len =
+            static_cast<size_t>(len) < buf_len - 1 ? len : buf_len - 1;
+        memcpy(buf_out, tmp, copy_len);
+        buf_out[copy_len] = '\0';
+        return len;
     } catch (...) {
         return -1;
     }

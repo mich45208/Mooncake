@@ -5,6 +5,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "client_service.h"
 #include "types.h"
 
 #include <cstdlib>  // for atexit
@@ -274,6 +275,36 @@ class MooncakeStorePyWrapper {
     int health_check() {
         if (!store_) return HC_NOT_INITIALIZED;
         return store_->health_check();
+    }
+
+    py::dict calc_cache_stats() {
+        py::dict result;
+        if (!is_client_initialized() || !store_->client_) {
+            return result;
+        }
+        auto stats_result = store_->client_->CalcCacheStats();
+        if (!stats_result.has_value()) {
+            return result;
+        }
+        using CS = MasterMetricManager::CacheHitStat;
+        auto& stats = stats_result.value();
+        static const std::unordered_map<CS, std::string> names = {
+            {CS::MEMORY_HITS, "memory_hits"},
+            {CS::SSD_HITS, "ssd_hits"},
+            {CS::MEMORY_TOTAL, "memory_total"},
+            {CS::SSD_TOTAL, "ssd_total"},
+            {CS::MEMORY_HIT_RATE, "memory_hit_rate"},
+            {CS::SSD_HIT_RATE, "ssd_hit_rate"},
+            {CS::OVERALL_HIT_RATE, "overall_hit_rate"},
+            {CS::VALID_GET_RATE, "valid_get_rate"}
+        };
+        for (auto& [key, val] : stats) {
+            auto it = names.find(key);
+            if (it != names.end()) {
+                result[py::cast(it->second)] = val;
+            }
+        }
+        return result;
     }
 
     std::string get_tp_key_name(const std::string &base_key, int rank) {
@@ -1726,6 +1757,24 @@ PYBIND11_MODULE(store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
+        .def("calc_cache_stats", &MooncakeStorePyWrapper::calc_cache_stats,
+             "Calculate cache hit statistics split by DRAM and SSD.\n\n"
+             "NOTE: ssd_hits and ssd_hit_rate are approximate. The master-side\n"
+             "SSD counters track metadata lookups (first replica type), not\n"
+             "actual SSD reads. For accurate per-tier Get observability, use\n"
+             "the client-side Prometheus metrics: get_from_memory_count,\n"
+             "get_from_disk_count, get_from_memory_bytes, get_from_disk_bytes.\n\n"
+             "Returns:\n"
+             "    dict: A dictionary with keys:\n"
+             "        memory_hits (float): Number of cache hits from DRAM\n"
+             "        ssd_hits (float): Number of cache hits from SSD (approximate)\n"
+             "        memory_total (float): Total cached values in DRAM\n"
+             "        ssd_total (float): Total cached values on SSD\n"
+             "        memory_hit_rate (float): DRAM hit rate\n"
+             "        ssd_hit_rate (float): SSD hit rate (approximate)\n"
+             "        overall_hit_rate (float): Combined hit rate\n"
+             "        valid_get_rate (float): Valid get rate\n"
+             "    Returns empty dict if client is not initialized.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

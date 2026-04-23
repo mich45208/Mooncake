@@ -1579,6 +1579,40 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
+    // Cache hit statistics (DRAM vs SSD)
+    // NOTE: SSD hit counts are approximate — they track metadata lookups
+    // (first replica type in GetReplicaList), not actual SSD reads.
+    // For accurate per-tier observability, use client-side Prometheus
+    // metrics: get_from_memory_count/bytes, get_from_disk_count/bytes.
+    int64_t mem_hits = mem_cache_hit_nums_.value();
+    int64_t file_hits = file_cache_hit_nums_.value();
+    int64_t mem_total = mem_cache_nums_.value();
+    int64_t file_total = file_cache_nums_.value();
+    int64_t valid_gets = valid_get_nums_.value();
+    int64_t total_gets = total_get_nums_.value();
+    ss << " | Cache Hits: DRAM=" << mem_hits << "/" << mem_total;
+    if (mem_total > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)mem_hits / (double)mem_total * 100.0) << "%)";
+    }
+    ss << ", SSD=" << file_hits << "/" << file_total;
+    if (file_total > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)file_hits / (double)file_total * 100.0) << "%)";
+    }
+    int64_t combined_hits = mem_hits + file_hits;
+    int64_t combined_total = mem_total + file_total;
+    ss << ", Overall=" << combined_hits << "/" << combined_total;
+    if (combined_total > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)combined_hits / (double)combined_total * 100.0) << "%)";
+    }
+    ss << ", ValidGet=" << valid_gets << "/" << total_gets;
+    if (total_gets > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)valid_gets / (double)total_gets * 100.0) << "%)";
+    }
+
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
     ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts
