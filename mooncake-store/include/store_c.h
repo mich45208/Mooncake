@@ -149,6 +149,19 @@ int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer);
 int mooncake_store_calc_cache_stats(mooncake_store_t store, char *buf_out,
                                     size_t buf_len);
 
+/**
+ * Get client-side transfer statistics by storage tier.
+ * Returns a JSON string with per-tier Get and Put counts and bytes.
+ * These are local counters (no RPC to master).
+ *
+ * @param store The store handle.
+ * @param buf_out Output buffer to write the JSON string.
+ * @param buf_len Size of the output buffer.
+ * @return Length of the JSON string on success, or -1 on error.
+ */
+int mooncake_store_get_client_stats(mooncake_store_t store, char *buf_out,
+                                    size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -569,3 +569,29 @@ func (s *Store) CalcCacheStats() (map[string]float64, error) {
 	}
 	return result, nil
 }
+
+// GetClientStats returns client-side transfer statistics by storage tier.
+// These are local counters (no RPC to master). For global view, use
+// Prometheus or the master's /metrics/summary endpoint.
+// Keys: get_from_memory_count, get_from_disk_count, get_from_memory_bytes,
+// get_from_disk_bytes, put_to_memory_count, put_to_disk_count,
+// put_to_memory_bytes, put_to_disk_bytes.
+func (s *Store) GetClientStats() (map[string]int64, error) {
+	if s.handle == nil {
+		return nil, ErrStoreNil
+	}
+	buf := make([]byte, 1024)
+	ret := C.mooncake_store_get_client_stats(s.handle, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if ret < 0 {
+		return nil, ErrInternal
+	}
+	n := int(ret)
+	if n > len(buf)-1 {
+		n = len(buf) - 1
+	}
+	var result map[string]int64
+	if err := json.Unmarshal(buf[:n], &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}

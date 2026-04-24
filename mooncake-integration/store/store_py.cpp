@@ -307,6 +307,23 @@ class MooncakeStorePyWrapper {
         return result;
     }
 
+    py::dict get_client_stats() {
+        py::dict result;
+        if (!is_client_initialized() || !store_->client_) {
+            return result;
+        }
+        auto stats = store_->client_->GetClientStats();
+        result[py::cast("get_from_memory_count")] = stats.get_from_memory_count;
+        result[py::cast("get_from_disk_count")] = stats.get_from_disk_count;
+        result[py::cast("get_from_memory_bytes")] = stats.get_from_memory_bytes;
+        result[py::cast("get_from_disk_bytes")] = stats.get_from_disk_bytes;
+        result[py::cast("put_to_memory_count")] = stats.put_to_memory_count;
+        result[py::cast("put_to_disk_count")] = stats.put_to_disk_count;
+        result[py::cast("put_to_memory_bytes")] = stats.put_to_memory_bytes;
+        result[py::cast("put_to_disk_bytes")] = stats.put_to_disk_bytes;
+        return result;
+    }
+
     std::string get_tp_key_name(const std::string &base_key, int rank) {
         return base_key + "_tp_" + std::to_string(rank);
     }
@@ -1775,6 +1792,15 @@ PYBIND11_MODULE(store, m) {
              "        overall_hit_rate (float): Combined hit rate\n"
              "        valid_get_rate (float): Valid get rate\n"
              "    Returns empty dict if client is not initialized.")
+        .def("get_client_stats", &MooncakeStorePyWrapper::get_client_stats,
+             "Get client-side transfer statistics by storage tier.\n\n"
+             "Returns local counters (no RPC to master). For global view,\n"
+             "use Prometheus or the master's /metrics/summary endpoint.\n\n"
+             "Returns:\n"
+             "    dict with keys: get_from_memory_count, get_from_disk_count,\n"
+             "    get_from_memory_bytes, get_from_disk_bytes,\n"
+             "    put_to_memory_count, put_to_disk_count,\n"
+             "    put_to_memory_bytes, put_to_disk_bytes")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

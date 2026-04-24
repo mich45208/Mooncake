@@ -1,4 +1,5 @@
 #include "master_metric_manager.h"
+#include "rpc_types.h"
 
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
@@ -1445,6 +1446,26 @@ void MasterMetricManager::add_stat_to_dict(
     }
 }
 
+void MasterMetricManager::aggregate_client_stats(
+    const ClientTransferStatsDelta& delta) {
+    global_get_from_memory_count_.fetch_add(delta.get_from_memory_count,
+                                            std::memory_order_relaxed);
+    global_get_from_disk_count_.fetch_add(delta.get_from_disk_count,
+                                          std::memory_order_relaxed);
+    global_get_from_memory_bytes_.fetch_add(delta.get_from_memory_bytes,
+                                            std::memory_order_relaxed);
+    global_get_from_disk_bytes_.fetch_add(delta.get_from_disk_bytes,
+                                          std::memory_order_relaxed);
+    global_put_to_memory_count_.fetch_add(delta.put_to_memory_count,
+                                          std::memory_order_relaxed);
+    global_put_to_disk_count_.fetch_add(delta.put_to_disk_count,
+                                        std::memory_order_relaxed);
+    global_put_to_memory_bytes_.fetch_add(delta.put_to_memory_bytes,
+                                          std::memory_order_relaxed);
+    global_put_to_disk_bytes_.fetch_add(delta.put_to_disk_bytes,
+                                        std::memory_order_relaxed);
+}
+
 // --- Human-Readable Summary ---
 std::string MasterMetricManager::get_summary_string() {
     std::stringstream ss;
@@ -1612,6 +1633,26 @@ std::string MasterMetricManager::get_summary_string() {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)valid_gets / (double)total_gets * 100.0) << "%)";
     }
+
+    // Global client-reported transfer stats (aggregated from Ping heartbeats)
+    ss << " | Client Get by Tier: DRAM="
+       << global_get_from_memory_count_.load(std::memory_order_relaxed)
+       << " (" << byte_size_to_string(
+              global_get_from_memory_bytes_.load(std::memory_order_relaxed))
+       << "), SSD="
+       << global_get_from_disk_count_.load(std::memory_order_relaxed)
+       << " (" << byte_size_to_string(
+              global_get_from_disk_bytes_.load(std::memory_order_relaxed))
+       << ")";
+    ss << " | Client Put by Tier: DRAM="
+       << global_put_to_memory_count_.load(std::memory_order_relaxed)
+       << " (" << byte_size_to_string(
+              global_put_to_memory_bytes_.load(std::memory_order_relaxed))
+       << "), SSD="
+       << global_put_to_disk_count_.load(std::memory_order_relaxed)
+       << " (" << byte_size_to_string(
+              global_put_to_disk_bytes_.load(std::memory_order_relaxed))
+       << ")";
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";

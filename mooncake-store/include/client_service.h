@@ -56,6 +56,21 @@ class QueryResult {
 };
 
 /**
+ * @brief Client-side transfer statistics by storage tier (DRAM vs SSD).
+ * These are local counters tracked on each client — no RPC needed.
+ */
+struct ClientTransferStats {
+    int64_t get_from_memory_count = 0;
+    int64_t get_from_disk_count = 0;
+    int64_t get_from_memory_bytes = 0;
+    int64_t get_from_disk_bytes = 0;
+    int64_t put_to_memory_count = 0;
+    int64_t put_to_disk_count = 0;
+    int64_t put_to_memory_bytes = 0;
+    int64_t put_to_disk_bytes = 0;
+};
+
+/**
  * @brief Client for interacting with the mooncake distributed object store
  */
 class Client {
@@ -447,6 +462,26 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    /**
+     * @brief Get client-side transfer statistics by storage tier.
+     * Reads local counters — no RPC to master. Returns per-client view.
+     */
+    ClientTransferStats GetClientStats() {
+        ClientTransferStats stats;
+        if (metrics_) {
+            auto& tm = metrics_->transfer_metric;
+            stats.get_from_memory_count = tm.get_from_memory_count.value();
+            stats.get_from_disk_count = tm.get_from_disk_count.value();
+            stats.get_from_memory_bytes = tm.get_from_memory_bytes.value();
+            stats.get_from_disk_bytes = tm.get_from_disk_bytes.value();
+            stats.put_to_memory_count = tm.put_to_memory_count.value();
+            stats.put_to_disk_count = tm.put_to_disk_count.value();
+            stats.put_to_memory_bytes = tm.put_to_memory_bytes.value();
+            stats.put_to_disk_bytes = tm.put_to_disk_bytes.value();
+        }
+        return stats;
+    }
+
     void ObserveTransferOperation(TransferOperationKind kind,
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
@@ -755,6 +790,9 @@ class Client {
     // Frequency admission: only cache keys whose CMS count >= threshold
     std::unique_ptr<CountMinSketch> admission_sketch_;
     uint8_t admission_threshold_ = 2;
+
+    // Snapshot of last-reported client stats for delta computation in Ping
+    ClientTransferStats last_stats_snapshot_{};
 };
 
 }  // namespace mooncake

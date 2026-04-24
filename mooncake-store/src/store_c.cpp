@@ -15,6 +15,7 @@
 #include "store_c.h"
 
 #include <cstring>
+#include <cinttypes>
 #include <memory>
 #include <new>
 #include <span>
@@ -394,6 +395,43 @@ int mooncake_store_calc_cache_stats(mooncake_store_t store, char *buf_out,
             get(CS::VALID_GET_RATE));
 
         if (len < 0) return -1;
+        size_t copy_len =
+            static_cast<size_t>(len) < buf_len - 1 ? len : buf_len - 1;
+        memcpy(buf_out, tmp, copy_len);
+        buf_out[copy_len] = '\0';
+        return len;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_get_client_stats(mooncake_store_t store, char *buf_out,
+                                    size_t buf_len) {
+    if (!store || !buf_out || buf_len == 0) return -1;
+    try {
+        auto *handle = static_cast<StoreHandle *>(store);
+        if (!handle->client || !handle->client->client_) return -1;
+
+        auto stats = handle->client->client_->GetClientStats();
+
+        char tmp[512];
+        int len = snprintf(
+            tmp, sizeof(tmp),
+            "{\"get_from_memory_count\":%" PRId64
+            ",\"get_from_disk_count\":%" PRId64
+            ",\"get_from_memory_bytes\":%" PRId64
+            ",\"get_from_disk_bytes\":%" PRId64
+            ",\"put_to_memory_count\":%" PRId64
+            ",\"put_to_disk_count\":%" PRId64
+            ",\"put_to_memory_bytes\":%" PRId64
+            ",\"put_to_disk_bytes\":%" PRId64 "}",
+            stats.get_from_memory_count, stats.get_from_disk_count,
+            stats.get_from_memory_bytes, stats.get_from_disk_bytes,
+            stats.put_to_memory_count, stats.put_to_disk_count,
+            stats.put_to_memory_bytes, stats.put_to_disk_bytes);
+
+        if (len < 0) return -1;
+        if (static_cast<size_t>(len) >= sizeof(tmp)) return -1;  // truncated
         size_t copy_len =
             static_cast<size_t>(len) < buf_len - 1 ? len : buf_len - 1;
         memcpy(buf_out, tmp, copy_len);
