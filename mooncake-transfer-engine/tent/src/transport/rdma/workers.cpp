@@ -19,6 +19,7 @@
 #include <cassert>
 
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/rail_monitor.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
@@ -27,6 +28,21 @@
 namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
+
+namespace {
+// Look up (or create) the RailMonitor for `machine_id` on this worker's
+// map. Returning a stable reference is safe because the map stores values
+// via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
+RailMonitor& getOrCreateRail(
+    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
+    const std::string& machine_id) {
+    auto it = rails.find(machine_id);
+    if (it != rails.end()) return *it->second;
+    auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
+    return *ins->second;
+}
+}  // namespace
+
 Workers::Workers(RdmaTransport* transport)
     : transport_(transport), num_workers_(0), running_(false) {
     device_quota_ = std::make_unique<DeviceQuota>();
@@ -122,28 +138,37 @@ Status Workers::cancel(RdmaSliceList& slice_list) {
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
-    std::string target_seg_name, target_dev_name;
-    std::string rpc_server_addr;
+    std::string rpc_server_addr, target_seg_name, target_dev_name;
     RouteHint hint;
+    auto& segment_manager = transport_->metadata_->segmentManager();
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    if (target_id == LOCAL_SEGMENT_ID) {
-        hint.segment = segment_manager.getLocal().get();
-    } else {
-        segment_manager.getRemoteCached(hint.segment, target_id);
-    }
-    if (hint.segment->type != SegmentType::Memory) return nullptr;
-    hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
-    if (target_id != LOCAL_SEGMENT_ID) {
-        rpc_server_addr = hint.segment->getMemory().rpc_server_addr;
-    }
-    target_seg_name = hint.segment->name;
-    target_dev_name = hint.topo->getNicName(device_id);
-    if (target_seg_name.empty() || target_dev_name.empty()) {
-        LOG(ERROR) << "Empty target segment or device name";
+
+    auto status =
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+            hint.segment = segment;
+            if (segment->type != SegmentType::Memory) {
+                return Status::NeedsRefreshCache(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+            hint.topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
+            if (target_id != LOCAL_SEGMENT_ID) {
+                rpc_server_addr = segment->rpc_server_addr;
+            }
+            target_seg_name = segment->name;
+            target_dev_name = hint.topo->getNicName(device_id);
+            if (target_seg_name.empty() || target_dev_name.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty target segment or device name" LOC_MARK);
+            }
+            return Status::OK();
+        });
+
+    if (!status.ok()) {
+        LOG(ERROR) << status.ToString();
         return nullptr;
     }
+
     auto context = transport_->context_set_[path.local_device_id].get();
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
         // LOG(WARNING) << "Context " << context->name() << " is not serving";
@@ -179,23 +204,12 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 }
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
-    SegmentDesc* desc = nullptr;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    auto target_id = slice->task->request.target_id;
-    if (target_id == LOCAL_SEGMENT_ID) {
-        desc = segment_manager.getLocal().get();
-    } else {
-        auto status = segment_manager.getRemoteCached(desc, target_id);
-        if (!status.ok()) return;
+    if (auto* rail = slice->rail_monitor) {
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id);
     }
-    if (desc) {
-        auto& worker = worker_context_[tl_wid];
-        auto& rail = worker.rails[desc->machine_id];
-        rail.markFailed(slice->source_dev_id, slice->target_dev_id);
-    }
-    if (slice->ep_weak_ptr) {
-        slice->ep_weak_ptr->acknowledge(slice, FAILED);
-        slice->ep_weak_ptr->reset();
+    if (auto ep = slice->ep_weak_ptr.lock()) {
+        ep->acknowledge(slice, FAILED);
+        ep->reset();
     }
 }
 
@@ -285,9 +299,15 @@ void Workers::asyncPollCq() {
     for (auto& slice : worker.inflight_slice_set) {
         if (slice->word != PENDING) continue;
         if (current_ts - slice->enqueue_ts > slice_timeout_ns_) {
-            auto ep = slice->ep_weak_ptr;
+            auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+            if (!ep) {
+                updateSliceStatus(slice, TIMEOUT);
+                slice_to_remove.push_back(slice);
+                worker.inflight_slices.fetch_sub(1);
+                continue;
+            }
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
             disableEndpoint(slice);
             worker.inflight_slices.fetch_sub(num_slices);
@@ -306,7 +326,7 @@ void Workers::asyncPollCq() {
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice*)wc[i].wr_id;
             worker.inflight_slice_set.erase(slice);
-            auto ep = slice->ep_weak_ptr;
+            auto ep = slice->ep_weak_ptr.lock();
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
@@ -316,6 +336,11 @@ void Workers::asyncPollCq() {
                                        overall_lat_sec);
             }
             if (slice->word != PENDING) continue;
+            if (!ep) {
+                updateSliceStatus(slice, FAILED);
+                num_slices++;
+                continue;
+            }
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     // TE handles them automatically
@@ -341,6 +366,14 @@ void Workers::asyncPollCq() {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful transfer proves this rail is healthy; clear
+                // any accumulated error count so a previously-cooled-down
+                // rail can be used again without waiting for the full
+                // cooldown to expire. The monitor pointer is resolved once
+                // in generatePostPath, so no map lookup is needed here.
+                if (auto* rail = slice->rail_monitor; rail && rail->ready())
+                    rail->markRecovered(slice->source_dev_id,
+                                        slice->target_dev_id);
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
             }
@@ -449,18 +482,20 @@ void Workers::monitorThread() {
 Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto& segment_manager = transport_->metadata_->segmentManager();
-    if (segment_id == LOCAL_SEGMENT_ID) {
-        hint.segment = segment_manager.getLocal().get();
-    } else {
-        CHECK_STATUS(segment_manager.getRemoteCached(hint.segment, segment_id));
-    }
-    hint.buffer = hint.segment->findBuffer(addr, length);
-    if (!hint.buffer) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-    if (hint.segment->type != SegmentType::Memory)
-        return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
+    CHECK_STATUS(segment_manager.withCachedSegment(
+        segment_id, [&](SegmentDesc* segment) {
+            hint.segment = segment;
+            hint.buffer = segment->findBuffer(addr, length);
+            if (!hint.buffer)
+                return Status::NeedsRefreshCache(
+                    "No matched buffer in given address range" LOC_MARK);
+
+            if (hint.segment->type != SegmentType::Memory)
+                return Status::NeedsRefreshCache(
+                    "Segment type not memory" LOC_MARK);
+            return Status::OK();
+        }));
+
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
     std::string location = hint.buffer->location;
     if (!hint.buffer->regions.empty()) {
@@ -510,9 +545,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = worker.rails[target.segment->machine_id];
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo);
+        rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
+                  transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
@@ -608,7 +644,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             reachable = (sdev == tdev);  // loopback is safe
         } else {
             auto& worker = worker_context_[tl_wid];
-            auto& rail = worker.rails[target.segment->machine_id];
+            auto& rail =
+                getOrCreateRail(worker.rails, target.segment->machine_id);
             reachable = rail.available(sdev, tdev);
         }
 
@@ -641,6 +678,11 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
+    // update rail state without a segment lookup or string-keyed map
+    // lookup on the hot path.
+    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
+                                           target.segment->machine_id);
     return Status::OK();
 }
 }  // namespace tent

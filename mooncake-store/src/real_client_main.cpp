@@ -52,6 +52,10 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::get_into_range_shm_helper>(
+        &real_client);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(
+        &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);
@@ -87,6 +91,10 @@ int main(int argc, char *argv[]) {
     mooncake::ResourceTracker::getInstance();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(argv[0]);
+    }
+
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
@@ -109,10 +117,11 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on 127.0.0.1:" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
+              << FLAGS_port;
 
     return server.start();
 }

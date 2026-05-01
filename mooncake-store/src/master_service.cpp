@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -15,7 +16,7 @@
 #include "segment.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 #endif
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
@@ -46,6 +47,13 @@ static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 namespace {
 
 constexpr size_t kUnlimitedSnapshotList = 0;
+
+// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
+// when offload-on-evict mode is active. Defers memory eviction for at most
+// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
+// falls back according to `offload_force_evict_`. A future change may expose
+// this as a configurable parameter if workloads demand tuning.
+constexpr double kOffloadCapRatio = 0.5;
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
@@ -158,6 +166,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
             "put_start_discard_timeout_sec");
     }
 
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    offload_on_evict_ = enable_offload_ && config.offload_on_evict;
+    if (offload_on_evict_) {
+        LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
+                     "LOCAL_DISK will occur at eviction time instead of "
+                     "PutEnd";
+        offload_force_evict_ = config.offload_force_evict;
+        if (offload_force_evict_) {
+            LOG(INFO) << "Force-evict enabled: objects exceeding offload "
+                         "cap will be evicted without disk offload";
+        }
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -173,6 +194,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     task_cleanup_thread_ =
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
+
+    job_dispatch_running_ = true;
+    job_dispatch_thread_ =
+        std::thread(&MasterService::JobDispatchThreadFunc, this);
+    VLOG(1) << "action=start_job_dispatch_thread";
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
@@ -237,6 +263,7 @@ MasterService::~MasterService() {
     client_monitor_running_ = false;
     snapshot_running_ = false;
     task_cleanup_running_ = false;
+    job_dispatch_running_ = false;
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
@@ -252,6 +279,9 @@ MasterService::~MasterService() {
     }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (job_dispatch_thread_.joinable()) {
+        job_dispatch_thread_.join();
     }
 }
 
@@ -341,12 +371,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::getAliveClientsSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    return ok_client_;
+}
+
 void MasterService::ClearInvalidHandles() {
+    ClearInvalidHandles(getAliveClientsSnapshot());
+}
+
+void MasterService::ClearInvalidHandles(
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
@@ -481,6 +522,17 @@ auto MasterService::QuerySegments(const std::string& segment)
         return tl::make_unexpected(err);
     }
     return std::make_pair(used, capacity);
+}
+
+auto MasterService::QuerySegmentStatus(const std::string& segment_name)
+    -> tl::expected<SegmentStatus, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return status;
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -821,13 +873,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
-    if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
+    if (it != shard->metadata.end() &&
+        !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -876,7 +930,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (enable_offload_) {
+    if (enable_offload_ && !offload_on_evict_) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
             &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
@@ -1064,6 +1118,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   during full metadata snapshots.
     // shard lock (exclusive via MetadataShardAccessorRW): serializes all
     //   operations on keys that hash to the same shard.
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -1073,7 +1128,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // --- Step 0: stale handle cleanup ---
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
-    if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
+    // Also clean up local_disk replicas whose owner client has expired.
+    if (it != shard->metadata.end() &&
+        CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
@@ -1303,6 +1360,23 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& tgt_segment : tgt_segments) {
+            if (!segment_access.ExistsSegmentName(tgt_segment)) {
+                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                           << ", error=target_segment_not_found";
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
+            if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                           << ", error=target_segment_not_allocatable";
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+    }
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -1509,6 +1583,21 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        if (!segment_access.ExistsSegmentName(tgt_segment)) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", error=target_segment_not_found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", error=target_segment_not_allocatable";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
     }
 
     MetadataAccessorRW accessor(this, key);
@@ -1878,6 +1967,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
+    auto alive_clients = getAliveClientsSnapshot();
+
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
@@ -1895,7 +1986,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -1943,10 +2034,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
-bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
-    // Remove those with invalid allocators
-    metadata.EraseReplicas([](const Replica& replica) {
-        return replica.has_invalid_mem_handle();
+bool MasterService::CleanupStaleHandles(
+    ObjectMetadata& metadata,
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    // Remove those with invalid allocators (memory replicas on unmounted
+    // segments) and local_disk replicas whose owner client is no longer alive.
+    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
+        return replica.has_invalid_mem_handle() ||
+               replica.has_stale_local_disk_client(alive_clients);
     });
 
     // Return true if no valid replicas remain after cleanup
@@ -2040,10 +2135,40 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    local_disk_segment_it->second->enable_offloading = enable_offloading;
-    if (enable_offloading) {
-        return std::move(local_disk_segment_it->second->offloading_objects);
+    std::unordered_map<std::string, int64_t> offloading_objects_copy;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        local_disk_segment_it->second->enable_offloading = enable_offloading;
+        if (enable_offloading) {
+            return std::move(local_disk_segment_it->second->offloading_objects);
+        }
+        // Offloading is disabled: clear the pending queue to prevent
+        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
+        // PushOffloadingQueue. We must also clean up corresponding
+        // offloading_tasks and decrement source replica refcounts to avoid
+        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
+        // Copy keys out before releasing the mutex to avoid lock order
+        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
+        // must release offloading_mutex_ before taking shard locks via
+        // MetadataAccessorRW.
+        offloading_objects_copy =
+            std::move(local_disk_segment_it->second->offloading_objects);
+    }
+
+    for (auto& [key, size] : offloading_objects_copy) {
+        MetadataAccessorRW accessor(this, key);
+        if (accessor.Exists()) {
+            auto& shard = accessor.GetShard();
+            auto task_it = shard->offloading_tasks.find(key);
+            if (task_it != shard->offloading_tasks.end()) {
+                auto source =
+                    accessor.Get().GetReplicaByID(task_it->second.source_id);
+                if (source) {
+                    source->dec_refcnt();
+                }
+                shard->offloading_tasks.erase(task_it);
+            }
+        }
     }
     return {};
 }
@@ -2121,10 +2246,13 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             offloading_queue_limit_) {
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
-        local_disk_segment_it->second->offloading_objects.emplace(
+        auto res = local_disk_segment_it->second->offloading_objects.emplace(
             key, replica.get_descriptor()
                      .get_memory_descriptor()
                      .buffer_descriptor.size_);
+        if (!res.second) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
     }
     return {};
 }
@@ -3413,6 +3541,81 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
+    // --- Offload-on-evict support ---
+    long offload_queued_this_cycle = 0;
+    long offload_deferred_count = 0;
+    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
+    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    const long offload_cap =
+        offload_on_evict_
+            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            : 0;
+
+    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    };
+
+    // Returns freed bytes. Returns 0 if offload-queued and no additional
+    // replicas were evicted (all MEMORY replicas of the key are now pinned).
+    auto try_evict_or_offload =
+        [&, this](const std::string& key, ObjectMetadata& metadata,
+                  MetadataShardAccessorRW& shard) -> uint64_t {
+        if (!offload_on_evict_) {
+            // Original behavior
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
+        if (has_local_disk_replica(metadata)) {
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Force-evict cap: if force_evict enabled and cap reached, force
+        // delete. Warning is aggregated at the end of the cycle to avoid log
+        // flooding.
+        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
+            offload_cap_forced_count++;
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Queue one MEMORY replica for offload; others will be evicted below.
+        bool queued = false;
+        metadata.VisitReplicas(
+            [](const Replica& r) {
+                return r.is_memory_replica() && r.is_completed() &&
+                       r.get_refcnt() == 0;
+            },
+            [this, &key, &shard, &queued, &now](Replica& replica) {
+                if (queued) return;  // only need to pin one replica for offload
+                auto result = PushOffloadingQueue(key, replica);
+                if (result) {
+                    replica.inc_refcnt();
+                    shard->offloading_tasks.emplace(
+                        key, OffloadingTask{replica.id(), now});
+                    queued = true;
+                }
+            });
+
+        if (queued) {
+            offload_queued_this_cycle++;
+            offload_deferred_count++;
+            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
+            // (data survives via the pinned replica → disk). Evict them now to
+            // reclaim memory immediately rather than waiting another cycle.
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
+        // skip this cycle — the outer eviction loop will retry after the
+        // offload queue drains. Only force-evict when explicitly opted in, to
+        // prevent silent data loss when the queue is unavailable.
+        if (offload_force_evict_) {
+            offload_push_failed_forced++;
+            return metadata.size * evict_replicas(metadata);
+        }
+        return 0;
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
@@ -3485,16 +3688,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
+                    // Evict this object (or defer for offload)
+                    uint64_t freed =
+                        try_evict_or_offload(it->first, it->second, shard);
+                    total_freed_size += freed;
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
-                    shard_evicted_count++;
+                    if (freed > 0) {
+                        shard_evicted_count++;
+                    }
                 } else {
                     // second pass candidates
                     no_pin_objects.push_back(it->second.lease_timeout);
@@ -3542,20 +3747,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = shard->metadata.begin();
                 while (it != shard->metadata.end() && target_evict_num > 0) {
                     if (!it->second.IsHardPinned() &&
+                        it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3595,16 +3802,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3625,7 +3834,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    if (evicted_count > 0 || released_discarded_cnt > 0 ||
+        offload_deferred_count > 0) {
+        // Offload-deferred counts as partial success: work was done (objects
+        // queued for disk offload), so suppress re-triggering until the next
+        // watermark breach or explicit need_eviction_ signal.
         need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
@@ -3637,7 +3850,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+            << ", offload_deferred=" << offload_deferred_count
+            << ", offload_cap_forced=" << offload_cap_forced_count
+            << ", offload_push_failed_forced=" << offload_push_failed_forced
             << ", total_freed_size=" << total_freed_size;
+    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
+                     << offload_deferred_count
+                     << " objects deferred for disk offload. "
+                        "Consider lowering eviction_high_watermark_ratio.";
+    }
+    if (offload_cap_forced_count > 0) {
+        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
+                     << ") reached; force-evicted " << offload_cap_forced_count
+                     << " object(s) without disk offload this cycle.";
+    }
+    if (offload_push_failed_forced > 0) {
+        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
+                     << offload_push_failed_forced
+                     << " object(s); force-evicted without disk offload "
+                        "(offload_force_evict=true).";
+    }
 }
 
 void MasterService::ClientMonitorFunc() {
@@ -3714,9 +3947,15 @@ void MasterService::ClientMonitorFunc() {
             }  // Release the mutex before long-running ClearInvalidHandles and
                // avoid deadlocks
 
-            if (!unmount_segments.empty()) {
-                ClearInvalidHandles();
+            // Always clean up invalid handles when there are expired clients,
+            // even if no memory segments were unmounted. This is necessary
+            // to clean up local_disk replicas whose owner client has expired.
+            ClearInvalidHandles();
 
+            // Commit unmount of memory segments and clean up local_disk
+            // segments for expired clients. Both require the exclusive
+            // segment lock.
+            {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
@@ -3725,6 +3964,9 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_segment";
+                }
+                for (auto& client_id : expired_clients) {
+                    segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
         }
@@ -4249,6 +4491,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                        << ", error=target_segment_not_mounted";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (!segment_accessor.IsSegmentAllocatable(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_allocatable";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
     }
 
     const auto& metadata = accessor.Get();
@@ -4300,6 +4548,11 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         LOG(ERROR) << "key=" << key << ", target_segment=" << target
                    << ", error=target_segment_not_mounted";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!segment_accessor.IsSegmentAllocatable(target)) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_allocatable";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     const auto& metadata = accessor.Get();
@@ -4361,6 +4614,474 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
         return tl::make_unexpected(err);
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
+    const CreateDrainJobRequest& request) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    return ValidateDrainRequestLocked(segment_access, request);
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
+    ScopedSegmentAccess& segment_access, const CreateDrainJobRequest& request) {
+    if (request.segments.empty() || request.max_concurrency == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unordered_set<std::string> unique_segments(request.segments.begin(),
+                                                    request.segments.end());
+    if (unique_segments.size() != request.segments.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    for (const auto& segment_name : request.segments) {
+        if (!segment_access.ExistsSegmentName(segment_name)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        if (status != SegmentStatus::OK) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    for (const auto& target_segment : request.target_segments) {
+        if (unique_segments.contains(target_segment)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!segment_access.ExistsSegmentName(target_segment)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (!segment_access.IsSegmentAllocatable(target_segment)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    return {};
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    std::vector<std::string> draining_segments;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        auto valid = ValidateDrainRequestLocked(segment_access, request);
+        if (!valid.has_value()) {
+            return tl::make_unexpected(valid.error());
+        }
+
+        draining_segments.reserve(request.segments.size());
+        for (const auto& segment_name : request.segments) {
+            auto err = segment_access.SetSegmentStatusByName(
+                segment_name, SegmentStatus::DRAINING);
+            if (err != ErrorCode::OK) {
+                for (const auto& updated_segment : draining_segments) {
+                    (void)segment_access.SetSegmentStatusByName(
+                        updated_segment, SegmentStatus::OK);
+                }
+                return tl::make_unexpected(err);
+            }
+            draining_segments.push_back(segment_name);
+        }
+    }
+
+    auto job = std::make_shared<DrainJob>();
+    job->id = generate_uuid();
+    job->request = request;
+    job->created_at = std::chrono::system_clock::now();
+    job->last_updated_at = job->created_at;
+    job->status = JobStatus::CREATED;
+    job->message = "Drain job created";
+
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        drain_jobs_.emplace(job->id, job);
+    }
+
+    return job->id;
+}
+
+tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
+    const UUID& job_id) {
+    std::shared_ptr<DrainJob> job;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        auto it = drain_jobs_.find(job_id);
+        if (it == drain_jobs_.end()) {
+            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
+        }
+        job = it->second;
+    }
+
+    std::lock_guard<std::mutex> job_lock(job->mutex);
+    QueryJobResponse response;
+    response.id = job->id;
+    response.type = job->type;
+    response.status = job->status;
+    response.created_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job->created_at.time_since_epoch())
+            .count());
+    response.last_updated_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job->last_updated_at.time_since_epoch())
+            .count());
+    response.segments = job->request.segments;
+    response.succeeded_units = job->succeeded_units;
+    response.failed_units = job->failed_units;
+    response.blocked_units = job->blocked_units;
+    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
+    response.migrated_bytes = job->migrated_bytes;
+    response.message = job->message;
+    return response;
+}
+
+tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
+    const UUID& job_id) {
+    std::shared_ptr<DrainJob> job;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        auto it = drain_jobs_.find(job_id);
+        if (it == drain_jobs_.end()) {
+            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
+        }
+        job = it->second;
+    }
+
+    std::vector<std::string> segments_to_restore;
+    {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
+        job->status = JobStatus::CANCELED;
+        job->last_updated_at = std::chrono::system_clock::now();
+        job->message = "Drain job canceled";
+        segments_to_restore = job->request.segments;
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    for (const auto& segment_name : segments_to_restore) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                ErrorCode::OK &&
+            status != SegmentStatus::UNMOUNTING) {
+            (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                        SegmentStatus::OK);
+        }
+    }
+    return {};
+}
+
+std::string MasterService::MakeDrainUnitKey(
+    const std::string& key, const std::string& source_segment) const {
+    return std::to_string(key.size()) + ":" + key + ":" + source_segment;
+}
+
+std::optional<std::string> MasterService::SelectDrainTargetForKey(
+    const ObjectMetadata& metadata, const std::string& source_segment,
+    const std::vector<std::string>& requested_targets) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::string> candidate_segments = requested_targets;
+    if (candidate_segments.empty()) {
+        auto err = segment_access.GetAllSegments(candidate_segments);
+        if (err != ErrorCode::OK) {
+            return std::nullopt;
+        }
+    }
+
+    const auto existing_segments = metadata.GetReplicaSegmentNames();
+    double best_util = std::numeric_limits<double>::max();
+    std::optional<std::string> best_target;
+    for (const auto& candidate : candidate_segments) {
+        if (candidate == source_segment) {
+            continue;
+        }
+        if (std::find(existing_segments.begin(), existing_segments.end(),
+                      candidate) != existing_segments.end()) {
+            continue;
+        }
+        if (!segment_access.IsSegmentAllocatable(candidate)) {
+            continue;
+        }
+        size_t used = 0, capacity = 0;
+        if (segment_access.QuerySegments(candidate, used, capacity) !=
+                ErrorCode::OK ||
+            capacity == 0) {
+            continue;
+        }
+        const double util =
+            static_cast<double>(used) / static_cast<double>(capacity);
+        if (util < best_util) {
+            best_util = util;
+            best_target = candidate;
+        }
+    }
+    return best_target;
+}
+
+void MasterService::RefreshDrainJobTasks(DrainJob& job) {
+    auto read_access = task_manager_.get_read_access();
+    std::vector<UUID> finished_task_ids;
+    finished_task_ids.reserve(job.active_tasks.size());
+
+    for (const auto& [task_id, active_task] : job.active_tasks) {
+        auto task_opt = read_access.find_task_by_id(task_id);
+        if (!task_opt.has_value()) {
+            finished_task_ids.push_back(task_id);
+            job.failed_units++;
+            job.terminal_failed_unit_keys.insert(active_task.unit_key);
+            continue;
+        }
+        if (!task_opt->is_finished()) {
+            continue;
+        }
+
+        finished_task_ids.push_back(task_id);
+        if (task_opt->status == TaskStatus::SUCCESS) {
+            job.succeeded_units++;
+            job.migrated_bytes += active_task.bytes;
+            job.completed_unit_keys.insert(active_task.unit_key);
+        } else {
+            job.failed_units++;
+            auto& retry_count = job.retry_counts[active_task.unit_key];
+            retry_count++;
+            if (retry_count >= kMaxDrainUnitRetries) {
+                job.terminal_failed_unit_keys.insert(active_task.unit_key);
+            }
+        }
+    }
+
+    for (const auto& task_id : finished_task_ids) {
+        job.active_tasks.erase(task_id);
+    }
+}
+
+void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
+    if (job.status == JobStatus::CREATED) {
+        job.status = JobStatus::PLANNING;
+    }
+
+    const uint32_t max_concurrency =
+        std::max<uint32_t>(1, job.request.max_concurrency);
+    if (job.active_tasks.size() >= max_concurrency) {
+        job.status = JobStatus::RUNNING;
+        return;
+    }
+
+    struct DrainPlan {
+        std::string key;
+        std::string source_segment;
+        std::string target_segment;
+        size_t bytes;
+        std::string unit_key;
+    };
+
+    const size_t slots = max_concurrency - job.active_tasks.size();
+    std::vector<DrainPlan> plans;
+    plans.reserve(slots);
+    std::unordered_set<std::string> active_unit_keys;
+    for (const auto& [_, task] : job.active_tasks) {
+        active_unit_keys.insert(task.unit_key);
+    }
+
+    std::unordered_set<std::string> blocked_unit_keys;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; ++i) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [key, metadata] : shard->metadata) {
+                for (const auto& source_segment : job.request.segments) {
+                    const auto unit_key = MakeDrainUnitKey(key, source_segment);
+                    if (job.completed_unit_keys.contains(unit_key) ||
+                        active_unit_keys.contains(unit_key) ||
+                        job.terminal_failed_unit_keys.contains(unit_key)) {
+                        continue;
+                    }
+
+                    const auto replica_segments =
+                        metadata.GetReplicaSegmentNames();
+                    if (std::find(replica_segments.begin(),
+                                  replica_segments.end(),
+                                  source_segment) == replica_segments.end()) {
+                        continue;
+                    }
+
+                    if (metadata.IsHardPinned() || !metadata.IsLeaseExpired() ||
+                        !metadata.AllReplicas(&Replica::fn_is_completed) ||
+                        shard->replication_tasks.contains(key)) {
+                        blocked_unit_keys.insert(unit_key);
+                        continue;
+                    }
+
+                    auto target = SelectDrainTargetForKey(
+                        metadata, source_segment, job.request.target_segments);
+                    if (!target.has_value()) {
+                        blocked_unit_keys.insert(unit_key);
+                        continue;
+                    }
+
+                    if (plans.size() < slots) {
+                        plans.push_back({key, source_segment, *target,
+                                         metadata.size, unit_key});
+                    }
+                }
+            }
+        }
+    }
+
+    job.blocked_units = blocked_unit_keys.size();
+
+    for (const auto& plan : plans) {
+        auto task_id =
+            CreateMoveTask(plan.key, plan.source_segment, plan.target_segment);
+        if (task_id.has_value()) {
+            ActiveDrainTask active_task;
+            active_task.task_id = task_id.value();
+            active_task.key = plan.key;
+            active_task.source_segment = plan.source_segment;
+            active_task.target_segment = plan.target_segment;
+            active_task.bytes = plan.bytes;
+            active_task.unit_key = plan.unit_key;
+            job.active_tasks.emplace(task_id.value(), std::move(active_task));
+        } else if (task_id.error() == ErrorCode::NO_AVAILABLE_HANDLE ||
+                   task_id.error() ==
+                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+                   task_id.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK) {
+            job.blocked_units++;
+        } else {
+            job.failed_units++;
+            auto& retry_count = job.retry_counts[plan.unit_key];
+            retry_count++;
+            if (retry_count >= kMaxDrainUnitRetries) {
+                job.terminal_failed_unit_keys.insert(plan.unit_key);
+            }
+        }
+    }
+
+    job.status = JobStatus::RUNNING;
+    job.last_updated_at = std::chrono::system_clock::now();
+    job.message = "Drain job running";
+}
+
+bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
+    if (!job.active_tasks.empty()) {
+        return false;
+    }
+
+    std::unordered_set<std::string> remaining_segments;
+    std::unordered_set<std::string> remaining_unit_keys;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; ++i) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [key, metadata] : shard->metadata) {
+                const auto replica_segments = metadata.GetReplicaSegmentNames();
+                for (const auto& source_segment : job.request.segments) {
+                    if (std::find(replica_segments.begin(),
+                                  replica_segments.end(),
+                                  source_segment) != replica_segments.end()) {
+                        remaining_segments.insert(source_segment);
+                        remaining_unit_keys.insert(
+                            MakeDrainUnitKey(key, source_segment));
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& segment_name : job.request.segments) {
+            if (!remaining_segments.contains(segment_name)) {
+                (void)segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::DRAINED);
+            }
+        }
+    }
+
+    if (remaining_segments.empty()) {
+        job.status = JobStatus::SUCCEEDED;
+        job.last_updated_at = std::chrono::system_clock::now();
+        job.message = "Drain job finished successfully";
+        return true;
+    }
+
+    bool all_remaining_terminal_failed = !remaining_unit_keys.empty();
+    for (const auto& unit_key : remaining_unit_keys) {
+        if (!job.terminal_failed_unit_keys.contains(unit_key)) {
+            all_remaining_terminal_failed = false;
+            break;
+        }
+    }
+    if (!all_remaining_terminal_failed) {
+        return false;
+    }
+
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& segment_name : job.request.segments) {
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                    ErrorCode::OK &&
+                status != SegmentStatus::UNMOUNTING) {
+                (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                            SegmentStatus::OK);
+            }
+        }
+    }
+
+    job.status = JobStatus::FAILED;
+    job.last_updated_at = std::chrono::system_clock::now();
+    job.message = "Drain job failed: unrecoverable units remain";
+    return true;
+}
+
+void MasterService::ProcessDrainJobs() {
+    std::vector<std::shared_ptr<DrainJob>> jobs;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        jobs.reserve(drain_jobs_.size());
+        for (const auto& [_, job] : drain_jobs_) {
+            jobs.push_back(job);
+        }
+    }
+
+    for (const auto& job : jobs) {
+        if (!job) {
+            continue;
+        }
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        RefreshDrainJobTasks(*job);
+        if (MaybeCompleteDrainJob(*job)) {
+            continue;
+        }
+        ScheduleDrainJobTasks(*job);
+    }
+}
+
+void MasterService::JobDispatchThreadFunc() {
+    while (job_dispatch_running_) {
+        ProcessDrainJobs();
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+    }
 }
 
 tl::expected<void, SerializationError>

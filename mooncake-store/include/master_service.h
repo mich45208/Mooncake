@@ -469,6 +469,28 @@ class MasterService {
                                                  const std::string& target);
 
     /**
+     * @brief Create a drain job to gracefully evacuate one or more segments.
+     */
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    /**
+     * @brief Query the status of a drain job.
+     */
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Cancel an in-flight drain job and restore draining segments to OK.
+     */
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Query current segment lifecycle state by segment name.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -540,14 +562,21 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+    void JobDispatchThreadFunc();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -868,7 +897,10 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -939,11 +971,21 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
@@ -1126,6 +1168,14 @@ class MasterService {
 
     const bool enable_offload_;
 
+    // Offload-on-evict: defer disk offload to eviction time
+    // (config: offload_on_evict)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (config: offload_force_evict, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
+
     const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;
@@ -1213,6 +1263,59 @@ class MasterService {
 
     // Task manager
     ClientTaskManager task_manager_;
+
+    struct ActiveDrainTask {
+        UUID task_id;
+        std::string key;
+        std::string source_segment;
+        std::string target_segment;
+        size_t bytes;
+        std::string unit_key;
+    };
+
+    struct DrainJob {
+        mutable std::mutex mutex;
+        UUID id;
+        JobType type{JobType::DRAIN};
+        JobStatus status{JobStatus::CREATED};
+        CreateDrainJobRequest request;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point last_updated_at;
+        std::string message;
+        uint64_t succeeded_units{0};
+        uint64_t failed_units{0};
+        uint64_t blocked_units{0};
+        uint64_t migrated_bytes{0};
+        std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
+            active_tasks;
+        std::unordered_set<std::string> completed_unit_keys;
+        std::unordered_map<std::string, uint32_t> retry_counts;
+        std::unordered_set<std::string> terminal_failed_unit_keys;
+    };
+
+    static constexpr uint32_t kMaxDrainUnitRetries = 3;
+
+    tl::expected<void, ErrorCode> ValidateDrainRequest(
+        const CreateDrainJobRequest& request);
+    tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
+        ScopedSegmentAccess& segment_access,
+        const CreateDrainJobRequest& request);
+    void ProcessDrainJobs();
+    void RefreshDrainJobTasks(DrainJob& job);
+    void ScheduleDrainJobTasks(DrainJob& job);
+    bool MaybeCompleteDrainJob(DrainJob& job);
+    std::optional<std::string> SelectDrainTargetForKey(
+        const ObjectMetadata& metadata, const std::string& source_segment,
+        const std::vector<std::string>& requested_targets);
+    std::string MakeDrainUnitKey(const std::string& key,
+                                 const std::string& source_segment) const;
+
+    std::thread job_dispatch_thread_;
+    std::atomic<bool> job_dispatch_running_{false};
+    static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    std::mutex job_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
+        drain_jobs_ GUARDED_BY(job_mutex_);
 };
 
 }  // namespace mooncake

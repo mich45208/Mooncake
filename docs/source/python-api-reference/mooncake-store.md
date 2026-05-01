@@ -264,6 +264,151 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 
 **Returns:** Number of bytes read, or negative on error
 
+#### get_into_ranges()
+Retrieve multiple byte ranges from multiple objects into registered buffers (zero-copy).
+
+```python
+def get_into_ranges(self, buffer_ptrs: List[int], all_keys: List[List[str]], all_dst_offsets: List[List[List[int]]], all_src_offsets: List[List[List[int]]], all_sizes: List[List[List[int]]]) -> List[List[List[int]]]
+```
+
+This API is **buffer-major** and supports **multiple fragments per key**.
+
+Think of the input shape as:
+- `buffer_ptrs[i]`: the `i`-th destination buffer
+- `all_keys[i][j]`: the `j`-th key that writes into buffer `i`
+- `all_dst_offsets[i][j][k]`: destination offset of fragment `k` for key `j` in buffer `i`
+- `all_src_offsets[i][j][k]`: source offset of fragment `k` inside key `j` for buffer `i`
+- `all_sizes[i][j][k]`: byte size of fragment `k`
+
+For each triple `(i, j, k)`, Mooncake reads the source range
+`[all_src_offsets[i][j][k], all_src_offsets[i][j][k] + all_sizes[i][j][k])`
+from object `all_keys[i][j]`, then writes it into destination buffer
+`buffer_ptrs[i]` at offset `all_dst_offsets[i][j][k]`.
+
+This lets one buffer gather interleaved fragments from multiple keys, and lets one key contribute multiple disjoint fragments to the same buffer in a single call.
+
+**Parameters:**
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Every buffer must be registered with `register_buffer()` before calling this API.
+- `all_keys`: For each buffer, the ordered list of source object keys to read from.
+- `all_dst_offsets`: For each buffer and key, the destination offsets of that key's fragments.
+- `all_src_offsets`: For each buffer and key, the source offsets of that key's fragments inside the object.
+- `all_sizes`: For each buffer and key, the byte lengths of that key's fragments.
+
+**Shape rules:**
+- `len(buffer_ptrs) == len(all_keys) == len(all_dst_offsets) == len(all_src_offsets) == len(all_sizes)`
+- For each buffer `i`, `len(all_keys[i]) == len(all_dst_offsets[i]) == len(all_src_offsets[i]) == len(all_sizes[i])`
+- For each `(buffer i, key j)`, `len(all_dst_offsets[i][j]) == len(all_src_offsets[i][j]) == len(all_sizes[i][j])`
+
+If a top-level shape or per-key fragment shape does not match, the corresponding result entries are negative error codes.
+
+**Returns:** A nested list of per-buffer, per-key, per-fragment results. `results[i][j][k]` is the number of bytes read for fragment `k`, or a negative value on error.
+
+A successful call can still contain per-fragment failures. For example, if one key is missing but another key in the same buffer is valid, the missing key's fragment result will be negative while the valid fragment can still succeed.
+
+**Typical scenarios:**
+- **Partial read from one object:** You only need a slice of a large value, such as a header, metadata block, or a small subrange of a tensor shard. In this case, use one buffer, one key, and one or more fragments under that key.
+- **Stitch multiple fragments from one object into one buffer:** You need several non-contiguous ranges from the same object and want to pack them into one destination buffer. In this case, keep a single key entry and place multiple fragments under that key.
+- **Stitch data from multiple objects into one buffer:** You want to assemble one logical payload from several keys. In this case, use one destination buffer and list multiple keys under that buffer, with each key contributing one or more fragments.
+- **Fill multiple output buffers in one call:** You have several destination buffers, each with its own read plan. In this case, each top-level entry in `buffer_ptrs` and the parallel nested arrays describes one independent destination buffer.
+
+**How to use it for partial reads:**
+If you only want part of an object, do not call `get_into()` with the full object buffer size. Instead:
+1. Allocate and register a destination buffer sized for the bytes you actually want to materialize.
+2. Put that buffer pointer into `buffer_ptrs`.
+3. Put the source key into `all_keys`.
+4. Set `all_src_offsets` to the start offsets of the object ranges you want.
+5. Set `all_sizes` to the lengths of those ranges.
+6. Set `all_dst_offsets` to where those ranges should land in your destination buffer.
+
+A useful way to think about the arguments is:
+- `buffer_ptrs` answers **where does the data land**
+- `all_keys` answers **which object does it come from**
+- `all_src_offsets` and `all_sizes` answer **which bytes should be read**
+- `all_dst_offsets` answers **where each fragment should be placed in the destination buffer**
+
+If you are extracting a single contiguous slice from one object, the minimal shape is:
+
+```python
+results = store.get_into_ranges(
+    [buffer_ptr],
+    [["my_key"]],
+    [[[0]]],
+    [[[src_offset]]],
+    [[[size]]],
+)
+```
+
+This means:
+- one destination buffer
+- one source key for that buffer
+- one fragment for that key
+- read `size` bytes from `my_key[src_offset:src_offset + size]`
+- write them into `buffer_ptr[0:size]`
+
+If you want to read several disjoint ranges from the same object and pack them together, keep the same key and add more fragments under it. For example:
+
+```python
+results = store.get_into_ranges(
+    [buffer_ptr],
+    [["my_key"]],
+    [[[0, 16, 40]]],
+    [[[128, 4096, 8192]]],
+    [[[8, 12, 4]]],
+)
+```
+
+This reads three fragments from `my_key` and places them into the same destination buffer at offsets `0`, `16`, and `40`. This pattern is useful when you want to assemble only the needed pieces of a large object without reading the whole value.
+
+If you want to assemble one output buffer from multiple objects, keep one top-level buffer entry and add multiple keys under it. Each key can still contribute one or more fragments. For example, you might put a header from `meta_key` at the front of the buffer, then place a payload slice from `data_key` after it.
+
+**Usage example:**
+
+```python
+import ctypes
+
+buffer_size = 32
+buffer0 = (ctypes.c_ubyte * buffer_size)()
+buffer1 = (ctypes.c_ubyte * buffer_size)()
+buffer_ptr0 = ctypes.addressof(buffer0)
+buffer_ptr1 = ctypes.addressof(buffer1)
+
+store.register_buffer(buffer_ptr0, buffer_size)
+store.register_buffer(buffer_ptr1, buffer_size)
+
+# Buffer 0 reads:
+# - from key1: two fragments -> src[1:5] -> dst[0:4], src[30:33] -> dst[20:23]
+# - from key2: one fragment  -> src[2:7] -> dst[8:13]
+# Buffer 1 reads:
+# - from key2: one fragment  -> src[0:6] -> dst[4:10]
+# - from key1: one fragment  -> src[10:14] -> dst[16:20]
+results = store.get_into_ranges(
+    [buffer_ptr0, buffer_ptr1],
+    [["key1", "key2"], ["key2", "key1"]],
+    [[[0, 20], [8]], [[4], [16]]],
+    [[[1, 30], [2]], [[0], [10]]],
+    [[[4, 3], [5]], [[6], [4]]],
+)
+
+# results == [
+#   [[4, 3], [5]],
+#   [[6], [4]],
+# ]
+```
+
+In the example above:
+- `results[0][0][0] == 4`: buffer 0, key 0 (`"key1"`), fragment 0 succeeded with 4 bytes
+- `results[0][0][1] == 3`: buffer 0, key 0 (`"key1"`), fragment 1 succeeded with 3 bytes
+- `results[0][1][0] == 5`: buffer 0, key 1 (`"key2"`), fragment 0 succeeded with 5 bytes
+
+**Common pitfalls:**
+- Do not flatten all fragments for a buffer into one list. Fragments must be grouped under their corresponding key.
+- `all_dst_offsets`, `all_src_offsets`, and `all_sizes` are 3D, but `all_keys` is 2D.
+- Buffer overflow is checked against the registered destination buffer size.
+- Source overflow is checked against the source object's size.
+- Full-object `get_into()` and ranged `get_into_ranges()` are different APIs; use `get_into()` when you want the whole object into one buffer.
+
+**Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
+
 ---
 
 ## ReplicateConfig Configuration
@@ -301,6 +446,16 @@ config = ReplicateConfig()
 config.with_soft_pin = True  # Keep this object in memory longer
 ```
 
+#### with_hard_pin
+**Type:** `bool`
+**Default:** `False`
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+
+```python
+config = ReplicateConfig()
+config.with_hard_pin = True  # Keep this object in memory that will not be evicted
+```
+
 #### preferred_segment
 **Type:** `str`
 **Default:** `""` (empty string)
@@ -328,6 +483,231 @@ config.preferred_segment = self.get_hostname()
 config = ReplicateConfig()
 config.prefer_alloc_in_same_node = "True
 ```
+---
+
+## Unified Parallel Tensor IO API
+
+Mooncake Store also provides a unified tensor IO family for tensors that are stored either as full objects or as explicitly identified parallel shards.
+
+This API family is the long-term interface for TP / DP / EP / PP-aware tensor IO:
+
+- write and upsert use `TensorParallelism`
+- reads use `ReadTarget`
+- legacy TP-only APIs remain available as compatibility wrappers
+
+### ParallelAxis
+
+`ParallelAxis` describes one axis in a shard identity.
+
+```python
+axis = mooncake.store.ParallelAxis()
+axis.kind = "tp"      # one of: "tp", "dp", "ep", "pp"
+axis.rank = 0
+axis.size = 8
+axis.split_dim = 1     # used for layout-sharding axes such as TP
+axis.expert_id = 3     # optional, for EP
+axis.stage_id = 1      # optional, for PP
+```
+
+**Fields:**
+- `kind`: Parallelism axis kind.
+- `rank`: Current shard rank on that axis.
+- `size`: Total number of shards on that axis.
+- `split_dim`: Optional tensor split dimension for layout-sharding axes.
+- `expert_id`: Optional expert identifier for EP layouts.
+- `stage_id`: Optional pipeline stage identifier for PP layouts.
+
+### TensorParallelism
+
+`TensorParallelism` is an ordered list of axes that identifies the stored or requested shard.
+
+```python
+parallelism = mooncake.store.TensorParallelism()
+parallelism.axes = [
+    tp_axis,
+]
+```
+
+Examples:
+- TP shard: `axes=[TP(...)]`
+- DP + TP shard: `axes=[DP(...), TP(...)]`
+- PP + TP shard: `axes=[PP(...), TP(...)]`
+- EP shard: `axes=[EP(...)]`
+
+### ReadTarget
+
+`ReadTarget` tells Mooncake whether the caller wants the stored form, a specific shard view, or the reconstructed full tensor.
+
+```python
+target = mooncake.store.ReadTarget()
+target.mode = "full"          # one of: "as_stored", "shard", "full"
+target.parallelism = None      # required for target shard reads
+```
+
+**Fields:**
+- `mode`: Read materialization mode.
+- `parallelism`: Optional `TensorParallelism`. Required when `mode="shard"`.
+
+### put_tensor_with_parallelism()
+
+Store a tensor using the unified parallelism model.
+
+```python
+def put_tensor_with_parallelism(
+    self,
+    key: str,
+    tensor,
+    parallelism: mooncake.store.TensorParallelism | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partition = None,
+) -> int
+```
+
+Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
+
+`writer_partition` is an optional write-side shorthand for full-tensor inputs that should be stored as one shard. It describes the writer's `(rank, size, split_dim)` and is mutually exclusive with `parallelism`; do not provide both in one call.
+
+For TP-containing multi-axis layouts, the caller may pass the full source tensor; Mooncake derives and persists the uniform shard selected by the requested TP rank/layout. That applies to layouts such as `dp_tp`, `pp_tp`, and `ep_tp`.
+
+Plain single-axis TP remains shard-input for compatibility.
+
+Pure DP still does not imply a split axis by itself.
+
+### batch_put_tensor_with_parallelism()
+
+Batch version of unified tensor writes.
+
+```python
+def batch_put_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    tensors: list,
+    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partitions = None,
+) -> list[int]
+```
+
+`writer_partitions` is an optional write-side convenience input for batch full-tensor writes that should be partitioned into stored shards. Each entry describes the target shard write as `(rank, size, split_dim)`.
+
+Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element. TP-containing `parallelisms` can now express the same full-tensor-input behavior too; `writer_partitions` remains the lighter explicit write-side shorthand.
+
+### get_tensor_with_parallelism()
+
+Read a tensor through the unified read path.
+
+```python
+def get_tensor_with_parallelism(
+    self,
+    key: str,
+    target: mooncake.store.ReadTarget | None = None,
+)
+```
+
+Typical modes:
+- `target=None` or `mode="as_stored"`: return the stored local object.
+- `mode="shard"`: return the target shard described by `target.parallelism`.
+- `mode="full"`: reconstruct and return the full tensor.
+
+### batch_get_tensor_with_parallelism()
+
+Batch version of unified tensor reads.
+
+```python
+def batch_get_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    targets: list[mooncake.store.ReadTarget | None] | None = None,
+) -> list
+```
+
+### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
+
+Zero-copy unified read forms. The destination buffers must be registered with `register_buffer()` before calling them.
+
+```python
+def get_tensor_with_parallelism_into(
+    self,
+    key: str,
+    buffer_ptr: int,
+    size: int,
+    target: mooncake.store.ReadTarget | None = None,
+)
+```
+
+```python
+def batch_get_tensor_with_parallelism_into(
+    self,
+    keys: list[str],
+    buffer_ptrs: list[int],
+    sizes: list[int],
+    targets: list[mooncake.store.ReadTarget | None] | None = None,
+) -> list
+```
+
+### upsert_tensor_with_parallelism()
+
+Unified upsert form for tensor objects.
+
+```python
+def upsert_tensor_with_parallelism(
+    self,
+    key: str,
+    tensor,
+    parallelism: mooncake.store.TensorParallelism | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partition = None,
+) -> int
+```
+
+The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts and the mutually exclusive `writer_partition` shorthand.
+
+### batch_upsert_tensor_with_parallelism()
+
+Batch unified upsert form.
+
+```python
+def batch_upsert_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    tensors: list,
+    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partitions = None,
+) -> list[int]
+```
+
+The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts.
+
+### *_from zero-copy write variants
+
+The unified write and upsert family also has `_from` variants for registered-memory inputs, including:
+
+- `put_tensor_with_parallelism_from(...)`
+- `batch_put_tensor_with_parallelism_from(...)`
+- `upsert_tensor_with_parallelism_from(...)`
+- `batch_upsert_tensor_with_parallelism_from(...)`
+
+These APIs accept registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
+
+```text
+[TensorObjectHeader + layout metadata][tensor data]
+```
+
+As with other zero-copy APIs, every source pointer must be registered with `register_buffer()` before use.
+
+### Compatibility wrappers
+
+Legacy TP-only methods such as:
+
+- `put_tensor_with_tp(...)`
+- `batch_put_tensor_with_tp(...)`
+- `get_tensor_with_tp(...)`
+- `batch_get_tensor_with_tp(...)`
+- corresponding `_into`, `_from`, and upsert variants
+
+remain supported for compatibility, but they are wrapper-style APIs around the unified parallel tensor IO model. Prefer the unified `*_with_parallelism` family for new code and new documentation examples.
+
 ---
 
 ## Non-Zero-Copy API (Simple Usage)
@@ -1049,6 +1429,79 @@ def init_all(self, protocol: str, device_name: str, mount_segment_size: int = 16
 
 ---
 
+#### mount_segment()
+Mount a local file or shared-memory region as one or more Mooncake store
+segments.
+
+```python
+def mount_segment(
+    self,
+    path: str,
+    size: int,
+    offset: int = 0,
+    protocol: str = "tcp",
+    location: str = "",
+) -> dict
+```
+
+**Parameters:**
+- `path` (str): File path to map and mount.
+- `size` (int): Number of bytes to mount.
+- `offset` (int, optional): File offset in bytes. Defaults to `0`.
+- `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
+- `location` (str, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Returns:**
+- `dict`: A result dictionary with:
+  - `ret` (int): Status code (0 = success, non-zero = error code)
+  - `segment_ids` (List[str]): Segment ids created by the mount operation
+
+**Example:**
+```python
+result = store.mount_segment(
+    "/dev/shm/mooncake_segment",
+    16 * 1024 * 1024,
+    offset=0,
+    protocol="tcp",
+    location="",
+)
+
+if result["ret"] == 0:
+    segment_ids = list(result["segment_ids"])
+    print("Mounted segments:", segment_ids)
+else:
+    print("Mount failed:", result["ret"])
+```
+
+The corresponding HTTP endpoints are `/api/mount_shm` and
+`/api/unmount_shm`, but the HTTP API is intentionally narrower: it accepts a
+named shared memory object name instead of an arbitrary path.
+
+---
+
+#### unmount_segment()
+Unmount one or more file or shared-memory segments by segment id.
+
+```python
+def unmount_segment(self, segment_ids: List[str]) -> int
+```
+
+**Parameters:**
+- `segment_ids` (List[str]): Segment ids returned by `mount_segment()`.
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+ret = store.unmount_segment(segment_ids)
+if ret != 0:
+    print("Unmount failed:", ret)
+```
+
+---
+
 #### get_hostname()
 Get the hostname of the current store instance.
 
@@ -1669,7 +2122,7 @@ def upsert_tensor(self, key: str, tensor: torch.Tensor) -> int
 #### upsert_tensor_from()
 
 Upsert a tensor directly from a pre-allocated buffer. The buffer layout must be
-`[TensorMetadata][tensor data]`, matching the layout used by
+`[TensorObjectHeader+layout metadata][tensor data]`, matching the layout used by
 `get_tensor_into()`.
 
 ```python
@@ -1689,7 +2142,7 @@ def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 #### batch_upsert_tensor_from()
 
 Upsert multiple tensors directly from pre-allocated buffers. Each buffer must
-use layout `[TensorMetadata][tensor data]`.
+use layout `[TensorObjectHeader+layout metadata][tensor data]`.
 
 ```python
 def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
@@ -1771,6 +2224,7 @@ def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tens
 - `List[int]`: List of status codes for each tensor operation.
 
 **Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
 
 ---
 

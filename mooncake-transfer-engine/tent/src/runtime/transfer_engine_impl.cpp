@@ -228,19 +228,31 @@ void setLogLevel(const std::string level) {
         FLAGS_minloglevel = google::ERROR;
 }
 
+static std::string readIdentityFile(const char* path) {
+    std::ifstream file(path);
+    if (!file) return "";
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    if (!content.empty() && content.back() == '\n') content.pop_back();
+    return content;
+}
+
 std::string getMachineID() {
-    std::ifstream file("/etc/machine-id");
-    if (file) {
-        std::string content((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-        if (!content.empty() && content.back() == '\n') content.pop_back();
-        return content;
-    } else {
-        std::string content = "undefined_machine_";
-        for (int i = 0; i < 16; ++i)
-            content += 'a' + SimpleRandom::Get().next(26);
-        return content;
+    const std::string boot_id =
+        readIdentityFile("/proc/sys/kernel/random/boot_id");
+    const std::string machine_id = readIdentityFile("/etc/machine-id");
+
+    if (!boot_id.empty() && !machine_id.empty()) {
+        return boot_id + ":" + machine_id;
     }
+
+    if (!boot_id.empty()) return boot_id;
+    if (!machine_id.empty()) return machine_id;
+
+    std::string content = "undefined_machine_";
+    for (int i = 0; i < 16; ++i) content += 'a' + SimpleRandom::Get().next(26);
+    LOG(WARNING) << "TENT getMachineID source=fallback value=" << content;
+    return content;
 }
 
 Status TransferEngineImpl::setupLocalSegment() {
@@ -249,9 +261,9 @@ Status TransferEngineImpl::setupLocalSegment() {
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
     segment->machine_id = getMachineID();
+    segment->rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
-    detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
     return manager.synchronizeLocal();
 }
@@ -291,6 +303,7 @@ Status TransferEngineImpl::construct() {
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
+    max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -593,9 +606,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
+    if (request_type != UNSPEC) {
+        if (request_type >= 0 && request_type < kSupportedTransportTypes &&
+            transport_list_[request_type]) {
+            result.push_back(request_type);
+        }
+        return result;
+    }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
+    if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
@@ -611,6 +632,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
     auto transports = getSupportedTransports(options.type);
+    if (transports.empty()) {
+        return Status::InvalidArgument(
+            "No available transport for registerLocalMemory" LOC_MARK);
+    }
 
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
@@ -794,9 +819,13 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
     } else {
         auto entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return UNSPEC;
-        bool same_machine =
-            (desc->machine_id ==
-             metadata_->segmentManager().getLocal()->machine_id);
+        bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
+        if (!same_machine) {
+            auto local_desc = metadata_->segmentManager().getLocal();
+            same_machine = local_desc && !desc->machine_id.empty() &&
+                           !local_desc->machine_id.empty() &&
+                           desc->machine_id == local_desc->machine_id;
+        }
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
@@ -806,6 +835,29 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
             }
         }
         return UNSPEC;
+    }
+}
+
+static const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case RDMA:
+            return "RDMA";
+        case MNNVL:
+            return "MNNVL";
+        case SHM:
+            return "SHM";
+        case NVLINK:
+            return "NVLINK";
+        case GDS:
+            return "GDS";
+        case IOURING:
+            return "IOURING";
+        case TCP:
+            return "TCP";
+        case AscendDirect:
+            return "AscendDirect";
+        default:
+            return "UNSPEC";
     }
 }
 
@@ -954,18 +1006,20 @@ RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
             toBufferKey(local_desc->findBuffer(source_addr, request.length));
     }
 
-    SegmentDesc* target_desc = nullptr;
-    if (request.target_id == LOCAL_SEGMENT_ID) {
-        target_desc = local_desc;
-    } else {
-        auto status = metadata->segmentManager().getRemoteCached(
-            target_desc, request.target_id);
-        if (!status.ok()) return boundary;
-    }
-    if (target_desc) {
-        boundary.target_key = toBufferKey(
-            target_desc->findBuffer(request.target_offset, request.length));
-    }
+    metadata->segmentManager().withCachedSegment(
+        request.target_id, [&](SegmentDesc* target_desc) {
+            auto buffer =
+                target_desc->findBuffer(request.target_offset, request.length);
+
+            if (!buffer) {
+                boundary.target_key = std::nullopt;
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            }
+
+            boundary.target_key = toBufferKey(buffer);
+            return Status::OK();
+        });
     return boundary;
 }
 
@@ -983,19 +1037,27 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
-    SegmentDesc* desc;
     if (request.target_id == LOCAL_SEGMENT_ID) return;
-    auto status =
-        metadata_->segmentManager().getRemoteCached(desc, request.target_id);
+
+    SegmentDesc* desc = nullptr;
+    BufferDesc* entry = nullptr;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        request.target_id, [&](SegmentDesc* segment) {
+            desc = segment;
+            entry = desc->findBuffer(request.target_offset, request.length);
+            if (!entry)
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        });
+
     if (!status.ok()) return;
-    auto entry = desc->findBuffer(request.target_offset, request.length);
-    if (!entry) return;
     auto local =
         Platform::getLoader().getLocation(request.source, 1)[0].location;
     auto remote = entry->location;
     auto local_mtype = getTypeEnum(LocationParser(local).type());
     auto remote_mtype = getTypeEnum(LocationParser(remote).type());
-    auto server_addr = desc->getMemory().rpc_server_addr;
+    auto server_addr = desc->rpc_server_addr;
     policy.clear();
     // case 1: rdma without gpu direct
     if (transport_list_[RDMA] && transport_list_[NVLINK]) {
@@ -1201,13 +1263,31 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
+    auto prev_type = task.type;
+
+    if (++task.failover_count > max_failover_attempts_) {
+        LOG(WARNING) << "Task failover limit reached ("
+                     << max_failover_attempts_
+                     << "), last transport=" << transportTypeName(prev_type);
+        return Status::InvalidEntry(
+            "Failover limit exceeded, all transports exhausted");
+    }
+
     if (task.staging)
         task.staging = false;
     else
         task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
-    if (type == UNSPEC)
+    if (type == UNSPEC) {
+        LOG(WARNING) << "No more transports available after "
+                     << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+
+    LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
+              << " -> " << transportTypeName(type) << " (attempt "
+              << task.failover_count << "/" << max_failover_attempts_ << ")";
+    TENT_RECORD_TRANSPORT_FAILOVER();
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])
@@ -1230,13 +1310,22 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
 }
 
 Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
-    SegmentDesc* desc = nullptr;
-    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
-    auto server_addr = desc->getMemory().rpc_server_addr;
-    if (server_addr.empty()) {
-        return Status::InvalidArgument("Requested segment type error" LOC_MARK);
-    }
-    return ControlClient::probe(server_addr);
+    return metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            auto rpc_server_addr = segment->rpc_server_addr;
+            if (rpc_server_addr.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty RPC server addr" LOC_MARK);
+            }
+            auto status = ControlClient::probe(rpc_server_addr);
+            if (status.IsRpcServiceError()) {
+                // Perhaps rpc_server_addr can be updated in the future
+                return Status::NeedsRefreshCache(
+                    "RPC service error: " + std::string{status.message()} +
+                    LOC_MARK);
+            }
+            return status;
+        });
 }
 
 Status TransferEngineImpl::receiveNotification(
@@ -1275,6 +1364,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                                   task_status));
     }
     batch->task_list[task_id].status = task_status.s;
+
+    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        batch->task_list[task_id].status = PENDING;
+    }
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1337,14 +1431,24 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
+        // memorize task result
+        task.status = task_status.s;
+
+        // Attempt failover before status aggregation so that a
+        // successfully resubmitted task appears as PENDING and does not
+        // overwrite a permanent FAILED from another task in the batch.
+        if (task_status.s == FAILED &&
+            resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
+            task_status.s = PENDING;
+        }
+
         if (task_status.s == COMPLETED) {
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;
-        } else {
+        } else if (task_status.s != PENDING) {
             overall_status.s = task_status.s;
         }
-        // memorize task result
-        task.status = task_status.s;
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
